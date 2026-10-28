@@ -1,0 +1,8 @@
+# Copy to ~/.config/youtube-watched/settings and fill in your own values.
+# Lines are "key = value"; lines starting with # are ignored.
+
+# SSH destination of the Kodi box (used by watched / yt-mark-watched)
+host = root@<kodi-ip>
+
+# Playlist that watched-playlist marks watched and empties (URL or ID)
+playlist = https://www.youtube.com/playlist?list=<playlist-id>

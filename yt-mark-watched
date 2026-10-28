@@ -1,0 +1,190 @@
+#!/usr/bin/python3
+"""Mark every video Kodi has played as watched on your YouTube account, then
+remove it from Kodi's queue. An entry is only removed if marking it watched
+succeeded; otherwise it stays and is retried next run. A video queued several
+times is marked once and all of its entries are removed.
+
+Kodi keeps the queue in /storage/yt-queue/; over SSH it only allows
+`list` (one "<name>\\t<url>" line per entry) and `rm <name>...`.
+
+Uses your browser's YouTube login cookies; nothing is downloaded.
+
+Usage: yt-mark-watched [--dry-run] [host] [browser]
+  --dry-run: mark watched, but don't remove anything from the queue
+  host: SSH destination of the Kodi box, e.g. root@<kodi-ip>; defaults to
+        `host` in ~/.config/youtube-watched/settings
+  browser: brave (default), chromium, firefox, chrome, ...
+
+Exits 0 if everything was handled, or if Kodi is not reachable (it's off).
+Exits 1 if anything failed; failed entries stay in the queue.
+"""
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
+SETTINGS = os.path.expanduser('~/.config/youtube-watched/settings')
+
+
+def read_settings():
+    """Return {key: value} from the settings file ("key = value" lines), or {}."""
+    settings = {}
+    try:
+        with open(SETTINGS) as f:
+            for line in f:
+                key, sep, value = line.partition('=')
+                if sep and not key.strip().startswith('#'):
+                    settings[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return settings
+
+# ssh's messages when the box is off or not on the network. Anything else
+# (host key changed, key not accepted, ...) is a real failure.
+UNREACHABLE = re.compile(
+    r'Connection timed out|Connection refused|No route to host|'
+    r'Network is unreachable|Could not resolve hostname|Operation timed out')
+
+# Entry names are <UTC date>-<UTC time>-<video ID>.
+NAME = re.compile(r'^[0-9]{8}-[0-9]{6}-[A-Za-z0-9_-]+$')
+
+
+class Unreachable(Exception):
+    pass
+
+
+def ssh(host, *command):
+    """Run an allowed command on Kodi and return its output."""
+    result = subprocess.run(
+        ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, *command],
+        capture_output=True, text=True)
+    if result.returncode == 255 and UNREACHABLE.search(result.stderr):
+        raise Unreachable
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f'ssh exited with {result.returncode}')
+    return result.stdout
+
+
+class Logger:
+    """Show warnings/errors and remember them, so we can tell if marking failed."""
+
+    def __init__(self):
+        self.warnings = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self.warnings.append(msg)
+        print(msg, file=sys.stderr)
+
+    def error(self, msg):
+        print(msg, file=sys.stderr)
+
+
+def read_queue(host):
+    """Return {video_id: [names]} in queue order, plus lines we couldn't parse."""
+    videos, bad = {}, []
+    for line in ssh(host, 'list').splitlines():
+        if not line.strip():
+            continue
+        name, _, url = line.partition('\t')
+        # Video IDs can contain '-', so take the ID from the URL, not the name.
+        video_id = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get('v', [''])[0]
+        if not NAME.match(name) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+            bad.append(line)
+            continue
+        videos.setdefault(video_id, []).append(name)
+    return videos, bad
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = '--dry-run' in args
+    args = [a for a in args if a != '--dry-run']
+    host = args[0] if len(args) > 0 else read_settings().get('host')
+    browser = args[1] if len(args) > 1 else 'brave'
+    if not host:
+        print(f'No Kodi host: pass one, or add "host = root@<kodi-ip>" to {SETTINGS}', file=sys.stderr)
+        return 1
+
+    try:
+        videos, bad = read_queue(host)
+    except Unreachable:
+        print('Kodi not reachable, skipping')
+        return 0
+    except RuntimeError as e:
+        print(f'Could not read the Kodi queue: {e}', file=sys.stderr)
+        return 1
+
+    failed = 0
+    for line in bad:
+        print(f'✗ could not parse queue entry, kept: {line!r}')
+        failed += 1
+    if not videos:
+        if not bad:
+            print('Queue is empty, nothing to do.')
+        return 1 if failed else 0
+
+    # yt-dlp can't detect the keyring under Hyprland, so point it at
+    # gnome-keyring (where Omarchy's Chromium browsers store the cookie key).
+    keyring = None if browser.startswith('firefox') else 'GNOMEKEYRING'
+
+    logger = Logger()
+    try:
+        ydl = YoutubeDL({
+            'cookiesfrombrowser': (browser, None, keyring, None),
+            'mark_watched': True,
+            'simulate': True,
+            'sleep_interval_requests': 1,
+            'logger': logger,
+        })
+        # Logged out, marking "succeeds" without a warning, so check first.
+        logged_in = ydl.get_info_extractor('Youtube').is_authenticated
+    except Exception as e:
+        print(f'Could not load {browser} cookies: {e}', file=sys.stderr)
+        return 1
+    if not logged_in:
+        print(f'Not logged in to YouTube in {browser}, nothing marked.', file=sys.stderr)
+        return 1
+
+    for i, (video_id, names) in enumerate(videos.items(), 1):
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        logger.warnings.clear()
+        try:
+            info = ydl.extract_info(url, download=False)
+        except DownloadError:
+            print(f'✗ {i}/{len(videos)}  {url}  (could not open video, kept in queue)')
+            failed += 1
+            continue
+        prefix = f'{i}/{len(videos)}  {info.get("title") or video_id}'
+        if len(names) > 1:
+            prefix += f'  (queued {len(names)}×)'
+        if any('Unable to mark' in w for w in logger.warnings):
+            print(f'✗ {prefix}  (marking watched failed, kept in queue)')
+            failed += 1
+            continue
+
+        if dry_run:
+            print(f'✓ {prefix}  (watched, dry run: would remove {" ".join(names)})')
+            continue
+        try:
+            ssh(host, 'rm', *names)
+        except (Unreachable, RuntimeError) as e:
+            print(f'~ {prefix}  (watched, but removing from queue failed: {str(e) or "Kodi not reachable"})')
+            failed += 1
+            continue
+        print(f'✓ {prefix}  (watched, removed from queue)')
+
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

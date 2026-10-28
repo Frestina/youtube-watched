@@ -1,0 +1,162 @@
+#!/usr/bin/python3
+"""Mark every video in one of your YouTube playlists as watched on your YouTube
+account, then remove it from the playlist. A video is only removed if marking
+it watched succeeded; otherwise it stays and is retried next run. Run it
+manually whenever you like.
+
+Uses your browser's YouTube login cookies; nothing is downloaded.
+
+Usage: yt-mark-playlist-watched [--dry-run] [playlist] [browser]
+  --dry-run: mark watched, but don't remove anything from the playlist
+  playlist: playlist URL or ID; defaults to `playlist` in
+            ~/.config/youtube-watched/settings
+  browser: brave (default), chromium, firefox, chrome, ...
+
+Exits 1 if anything failed; failed videos stay in the playlist.
+"""
+import os
+import sys
+import urllib.parse
+
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
+SETTINGS = os.path.expanduser('~/.config/youtube-watched/settings')
+
+
+def read_settings():
+    """Return {key: value} from the settings file ("key = value" lines), or {}."""
+    settings = {}
+    try:
+        with open(SETTINGS) as f:
+            for line in f:
+                key, sep, value = line.partition('=')
+                if sep and not key.strip().startswith('#'):
+                    settings[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return settings
+
+
+class Logger:
+    """Show warnings/errors and remember them, so we can tell if marking failed."""
+
+    def __init__(self):
+        self.warnings = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self.warnings.append(msg)
+        print(msg, file=sys.stderr)
+
+    def error(self, msg):
+        print(msg, file=sys.stderr)
+
+
+def remove_from_playlist(ydl, playlist_id, video_id):
+    """Remove every copy of the video from the playlist. Returns an error, or None."""
+    youtube = ydl.get_info_extractor('Youtube')
+    try:
+        response = youtube._call_api('browse/edit_playlist', {
+            'playlistId': playlist_id,
+            'actions': [{'action': 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID', 'removedVideoId': video_id}],
+        }, video_id, note=False)
+    except Exception as e:
+        return str(e) or type(e).__name__
+    status = response.get('status')
+    return None if status == 'STATUS_SUCCEEDED' else f'YouTube answered {status or response}'
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = '--dry-run' in args
+    args = [a for a in args if a != '--dry-run']
+    playlist = args[0] if len(args) > 0 else read_settings().get('playlist')
+    browser = args[1] if len(args) > 1 else 'brave'
+    if not playlist:
+        print(f'No playlist: pass one, or add "playlist = <playlist URL>" to {SETTINGS}', file=sys.stderr)
+        return 1
+    if '/' in playlist:
+        playlist_id = urllib.parse.parse_qs(urllib.parse.urlparse(playlist).query).get('list', [''])[0]
+    else:
+        playlist_id = playlist
+    if not playlist_id:
+        print(f'No playlist ID in {playlist}', file=sys.stderr)
+        return 1
+    playlist = f'https://www.youtube.com/playlist?list={playlist_id}'
+
+    # yt-dlp can't detect the keyring under Hyprland, so point it at
+    # gnome-keyring (where Omarchy's Chromium browsers store the cookie key).
+    keyring = None if browser.startswith('firefox') else 'GNOMEKEYRING'
+
+    logger = Logger()
+    try:
+        ydl = YoutubeDL({
+            'cookiesfrombrowser': (browser, None, keyring, None),
+            'mark_watched': True,
+            'simulate': True,
+            'sleep_interval_requests': 1,
+            'logger': logger,
+        })
+        # Logged out, marking "succeeds" without a warning, so check first.
+        logged_in = ydl.get_info_extractor('Youtube').is_authenticated
+    except Exception as e:
+        print(f'Could not load {browser} cookies: {e}', file=sys.stderr)
+        return 1
+    if not logged_in:
+        print(f'Not logged in to YouTube in {browser}, nothing marked.', file=sys.stderr)
+        return 1
+
+    # List the playlist without opening each video; marking happens below.
+    try:
+        with YoutubeDL({
+            'cookiesfrombrowser': (browser, None, keyring, None),
+            'extract_flat': True,
+            'logger': logger,
+        }) as lister:
+            info = lister.extract_info(playlist, download=False)
+    except DownloadError:
+        print(f'Could not read the playlist {playlist}', file=sys.stderr)
+        return 1
+    video_ids = list(dict.fromkeys(e['id'] for e in info.get('entries') or [] if e))
+    if not video_ids:
+        print(f'Playlist "{info.get("title") or playlist}" is empty, nothing to do.')
+        return 0
+    print(f'Playlist "{info.get("title") or playlist}": {len(video_ids)} videos')
+
+    failed = 0
+    for i, video_id in enumerate(video_ids, 1):
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        logger.warnings.clear()
+        try:
+            info = ydl.extract_info(url, download=False)
+        except DownloadError:
+            print(f'✗ {i}/{len(video_ids)}  {url}  (could not open video, kept in playlist)')
+            failed += 1
+            continue
+        prefix = f'{i}/{len(video_ids)}  {info.get("title") or video_id}'
+        if any('Unable to mark' in w for w in logger.warnings):
+            print(f'✗ {prefix}  (marking watched failed, kept in playlist)')
+            failed += 1
+            continue
+
+        if dry_run:
+            print(f'✓ {prefix}  (watched, dry run: would remove from playlist)')
+            continue
+        error = remove_from_playlist(ydl, playlist_id, video_id)
+        if error:
+            print(f'~ {prefix}  (watched, but removing from playlist failed: {error})')
+            failed += 1
+            continue
+        print(f'✓ {prefix}  (watched, removed from playlist)')
+
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
