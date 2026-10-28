@@ -377,3 +377,9 @@ rm -r ~/scripts/youtube-watched ~/.config/youtube-watched
 
 Then remove the `Host kodi …` block from `~/.ssh/config` if you no longer need
 it.
+
+---
+
+## License
+
+MIT, see [LICENSE](LICENSE).
