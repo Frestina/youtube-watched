@@ -4,8 +4,19 @@ remove it from Kodi's queue. An entry is only removed if marking it watched
 succeeded; otherwise it stays and is retried next run. A video queued several
 times is marked once and all of its entries are removed.
 
-Kodi keeps the queue in /storage/yt-queue/; over SSH it only allows
-`list` (one "<name>\\t<url>" line per entry) and `rm <name>...`.
+A video that can't be opened (YouTube says it's unavailable, private, removed,
+...) stays in the queue too, but only for MAX_ATTEMPTS runs: on the last one it
+is removed from the queue unmarked. Network errors don't count as attempts.
+The counts are kept in ~/.local/state/youtube-watched/open-failures.json.
+
+Kodi keeps the queue in /storage/yt-queue/: one file per played video, named
+<UTC date>-<UTC time>-<video ID>, holding the video's URL. The script reads
+and removes those files over SSH.
+
+Some videos (e.g. ones whose uploader turned off embedding) can't be opened by
+yt-dlp's logged-in clients, which then report "Video unavailable" although the
+video plays fine. Such a video is opened a second time without asking for
+playable formats, which is enough to mark it watched.
 
 Uses your browser's YouTube login cookies; nothing is downloaded.
 
@@ -15,9 +26,11 @@ Usage: yt-mark-watched [--dry-run] [host] [browser]
         `host` in ~/.config/youtube-watched/settings
   browser: brave (default), chromium, firefox, chrome, ...
 
-Exits 0 if everything was handled, or if Kodi is not reachable (it's off).
-Exits 1 if anything failed; failed entries stay in the queue.
+Exits 0 if everything was handled (including giving up on a video), or if
+Kodi is not reachable (it's off). Exits 1 if anything failed; failed entries
+stay in the queue.
 """
+import json
 import os
 import re
 import subprocess
@@ -25,9 +38,18 @@ import sys
 import urllib.parse
 
 from yt_dlp import YoutubeDL
+from yt_dlp.networking.exceptions import TransportError
 from yt_dlp.utils import DownloadError
 
+QUEUE_DIR = '/storage/yt-queue'
 SETTINGS = os.path.expanduser('~/.config/youtube-watched/settings')
+STATE_DIR = os.path.join(
+    os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state'),
+    'youtube-watched')
+FAILURES = os.path.join(STATE_DIR, 'open-failures.json')
+
+# Runs in which a video couldn't be opened before it is removed from the queue.
+MAX_ATTEMPTS = 3
 
 
 def read_settings():
@@ -42,6 +64,30 @@ def read_settings():
     except FileNotFoundError:
         pass
     return settings
+
+def read_failures():
+    """Return {video_id: runs it couldn't be opened}, or {}."""
+    try:
+        with open(FAILURES) as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, int)} if isinstance(data, dict) else {}
+
+
+def write_failures(failures):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = FAILURES + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(failures, f, indent=1, sort_keys=True)
+    os.replace(tmp, FAILURES)
+
+
+def is_network_error(err):
+    """True if a DownloadError came from the network rather than from YouTube."""
+    exc = (err.exc_info or (None, None))[1]
+    return isinstance(exc, TransportError) or isinstance(getattr(exc, 'cause', None), TransportError)
+
 
 # ssh's messages when the box is off or not on the network. Anything else
 # (host key changed, key not accepted, ...) is a real failure.
@@ -89,13 +135,25 @@ class Logger:
         print(msg, file=sys.stderr)
 
 
+# Prints one "<name>\t<first line of the file>" line per queue file. The
+# trailing `true` keeps an empty queue (the glob matching nothing) a success.
+LIST_QUEUE = (f'cd {QUEUE_DIR} && for f in *; do [ -f "$f" ] && '
+              'printf "%s\\t%s\\n" "$f" "$(head -n 1 "$f")"; done; true')
+
+
+def remove_from_queue(host, names):
+    """Delete queue entries. Names have already been checked against NAME."""
+    ssh(host, 'rm', '-f', '--', *(f'{QUEUE_DIR}/{name}' for name in names))
+
+
 def read_queue(host):
     """Return {video_id: [names]} in queue order, plus lines we couldn't parse."""
     videos, bad = {}, []
-    for line in ssh(host, 'list').splitlines():
+    for line in ssh(host, LIST_QUEUE).splitlines():
         if not line.strip():
             continue
         name, _, url = line.partition('\t')
+        url = url.strip()
         # Video IDs can contain '-', so take the ID from the URL, not the name.
         video_id = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get('v', [''])[0]
         if not NAME.match(name) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
@@ -128,6 +186,10 @@ def main():
     for line in bad:
         print(f'✗ could not parse queue entry, kept: {line!r}')
         failed += 1
+    # Forget counts for videos no longer in the queue.
+    failures = {k: v for k, v in read_failures().items() if k in videos}
+    if not dry_run:
+        write_failures(failures)
     if not videos:
         if not bad:
             print('Queue is empty, nothing to do.')
@@ -138,14 +200,18 @@ def main():
     keyring = None if browser.startswith('firefox') else 'GNOMEKEYRING'
 
     logger = Logger()
+    params = {
+        'cookiesfrombrowser': (browser, None, keyring, None),
+        'mark_watched': True,
+        'simulate': True,
+        'sleep_interval_requests': 1,
+        'logger': logger,
+    }
     try:
-        ydl = YoutubeDL({
-            'cookiesfrombrowser': (browser, None, keyring, None),
-            'mark_watched': True,
-            'simulate': True,
-            'sleep_interval_requests': 1,
-            'logger': logger,
-        })
+        ydl = YoutubeDL(params)
+        # For videos the logged-in clients get no playable formats for (e.g.
+        # embedding turned off): marking watched doesn't need formats.
+        ydl_no_formats = YoutubeDL({**params, 'ignore_no_formats_error': True})
         # Logged out, marking "succeeds" without a warning, so check first.
         logged_in = ydl.get_info_extractor('Youtube').is_authenticated
     except Exception as e:
@@ -160,9 +226,48 @@ def main():
         logger.warnings.clear()
         try:
             info = ydl.extract_info(url, download=False)
-        except DownloadError:
-            print(f'✗ {i}/{len(videos)}  {url}  (could not open video, kept in queue)')
-            failed += 1
+        except DownloadError as e:
+            info, err = None, e
+            if not is_network_error(err):
+                logger.warnings.clear()
+                try:
+                    info = ydl_no_formats.extract_info(url, download=False)
+                except DownloadError as e2:
+                    err = e2
+                else:
+                    # A video that really is gone still "opens" this way, but
+                    # without the data needed to mark it.
+                    if any('Unable to mark' in w for w in logger.warnings):
+                        info = None
+        if info is None:
+            if is_network_error(err):
+                print(f'✗ {i}/{len(videos)}  {url}  (network error, kept in queue)')
+                failed += 1
+                continue
+            attempts = failures.get(video_id, 0) + 1
+            if attempts < MAX_ATTEMPTS:
+                if not dry_run:
+                    failures[video_id] = attempts
+                    write_failures(failures)
+                print(f'✗ {i}/{len(videos)}  {url}  (could not open video, '
+                      f'attempt {attempts}/{MAX_ATTEMPTS}, kept in queue)')
+                failed += 1
+                continue
+            if dry_run:
+                print(f'– {i}/{len(videos)}  {url}  (could not open video {attempts} times, '
+                      f'dry run: would remove {" ".join(names)})')
+                continue
+            try:
+                remove_from_queue(host, names)
+            except (Unreachable, RuntimeError) as e:
+                print(f'✗ {i}/{len(videos)}  {url}  (could not open video {attempts} times, '
+                      f'and removing from queue failed: {str(e) or "Kodi not reachable"})')
+                failed += 1
+                continue
+            failures.pop(video_id, None)
+            write_failures(failures)
+            print(f'– {i}/{len(videos)}  {url}  (could not open video {attempts} times, '
+                  f'removed from queue unmarked)')
             continue
         prefix = f'{i}/{len(videos)}  {info.get("title") or video_id}'
         if len(names) > 1:
@@ -176,11 +281,13 @@ def main():
             print(f'✓ {prefix}  (watched, dry run: would remove {" ".join(names)})')
             continue
         try:
-            ssh(host, 'rm', *names)
+            remove_from_queue(host, names)
         except (Unreachable, RuntimeError) as e:
             print(f'~ {prefix}  (watched, but removing from queue failed: {str(e) or "Kodi not reachable"})')
             failed += 1
             continue
+        if failures.pop(video_id, None) is not None:
+            write_failures(failures)
         print(f'✓ {prefix}  (watched, removed from queue)')
 
     return 1 if failed else 0

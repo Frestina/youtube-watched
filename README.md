@@ -21,12 +21,23 @@ box is already set up (see [Before you start](#before-you-start)).
 
 **`watched` (Kodi queue)**
 
-1. Over SSH it asks Kodi which videos it has played (`ssh <kodi> list`).
+1. Over SSH it reads which videos Kodi has played: one file per video in
+   `/storage/yt-queue/`, named `<date>-<time>-<video ID>` and holding the
+   video's URL.
 2. It opens each video with yt-dlp, logged in with your browser's YouTube
    cookies, and tells YouTube you watched it.
 3. When marking works, it removes that video from Kodi's queue
-   (`ssh <kodi> rm <name>`). When marking fails, the video stays in the queue
-   and is tried again on the next run.
+   (deletes its file). When marking fails, the video stays in the queue and is
+   tried again on the next run.
+4. A video YouTube won't open at all (unavailable, private, removed) is tried
+   on 3 runs, then removed from Kodi's queue without being marked. Network
+   errors don't count towards the 3. The counts are kept in
+   `~/.local/state/youtube-watched/open-failures.json`.
+
+Some videos, for example ones whose uploader turned off embedding, give
+"Video unavailable" when yt-dlp is logged in although they play fine. Such a
+video is opened a second time without asking YouTube for playable formats,
+which is still enough to mark it watched.
 
 A video that is in the queue several times is marked once, and every copy is
 removed.
@@ -54,7 +65,8 @@ You need:
 - **A browser that is logged in to YouTube.** Brave is the default. Chromium,
   Chrome and Firefox also work.
 - **For `watched` only: a Kodi box with the queue already set up.** Kodi has to
-  write played videos to its queue and allow the SSH commands `list` and `rm`.
+  write each played video to a file in `/storage/yt-queue/`, and allow SSH
+  logins with a shell (the script runs `cd`, `head`, `printf` and `rm` there).
   Your desktop's SSH public key must be on the Kodi box (step 4 below).
 
 ---
@@ -181,10 +193,10 @@ to `root@<kodi-ip>`, not to `kodi`.
 The first connection asks you to trust the Kodi box. Do it by hand once:
 
 ```bash
-ssh root@<kodi-ip> list
+ssh root@<kodi-ip> ls /storage/yt-queue
 ```
 
-Type `yes`. You should then see one line per queued video (or nothing if the
+Type `yes`. You should then see one file per queued video (or nothing if the
 queue is empty). If you get `Permission denied`, Kodi doesn't have your key
 yet (step 4a).
 
@@ -337,6 +349,9 @@ emptied.
 | `✓ … (watched, removed from queue)` / `(…from playlist)` | Done. |
 | `✗ … (marking watched failed, kept in …)` | YouTube refused. It's tried again next run. |
 | `✗ … (could not open video, kept in …)` | Video deleted, private, or yt-dlp is outdated. |
+| `✗ … (could not open video, attempt N/3, kept in queue)` | YouTube wouldn't open it (watched only). It's tried again next run, up to 3 runs. |
+| `– … (could not open video 3 times, removed from queue unmarked)` | Gave up on it: removed from Kodi's queue without marking it watched. |
+| `✗ … (network error, kept in queue)` | yt-dlp couldn't reach YouTube. Doesn't count towards the 3 attempts. |
 | `~ … (watched, but removing from … failed: …)` | Marked, but not removed. The next run marks it again (harmless) and tries removing it again. |
 | `✗ could not parse queue entry, kept: …` | Kodi's queue has a line the script doesn't understand. |
 | `Queue is empty, nothing to do.` / `Playlist "…" is empty, nothing to do.` | Nothing to mark. |
@@ -359,6 +374,7 @@ failed. In the timer's log, a failed run shows as `Failed with result
 | `Could not read the playlist …` | Wrong playlist address, or the playlist belongs to another account than the one logged in. |
 | `Could not read the Kodi queue: Host key verification failed.` | Do step 4c once by hand. If Kodi was reinstalled, its host key changed: `ssh-keygen -R <kodi-ip>`, then step 4c again. |
 | `Could not read the Kodi queue: Permission denied …` | Kodi doesn't have your public key (step 4a), or the Host block points at the wrong key. |
+| `Could not read the Kodi queue: … can't cd to /storage/yt-queue …` | The queue folder doesn't exist on Kodi yet; nothing has been played since it was set up, or Kodi's queue writer isn't installed. |
 | Password-manager popup every hour | The Host block (step 4b) is missing, or its `Host` line doesn't include the IP. Check with `ssh -G root@<kodi-ip> \| grep -i identity`; it should show `identityagent none`. |
 | Works by hand but not from the timer | Check `journalctl --user -u yt-mark-watched`. Usually the keyring wasn't unlocked yet, or the path in `ExecStart` is wrong. |
 | Lots of `✗ could not open video` | Update yt-dlp: `sudo pacman -Syu`. |
