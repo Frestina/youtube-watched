@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 
 from yt_dlp import YoutubeDL
@@ -81,6 +82,28 @@ def write_failures(failures):
     with open(tmp, 'w') as f:
         json.dump(failures, f, indent=1, sort_keys=True)
     os.replace(tmp, FAILURES)
+
+
+# yt-dlp counts you as logged in when LOGIN_INFO and one of the SAPISID
+# cookies are there. YouTube clears LOGIN_INFO when it rotates login cookies.
+LOGIN_COOKIES = ('LOGIN_INFO', 'SAPISID', '__Secure-1PAPISID', '__Secure-3PAPISID')
+
+
+def describe_login_cookies(cookiejar, browser):
+    """One line on the YouTube login cookies the browser gave us, by name only."""
+    now = time.time()
+    youtube = [c for c in cookiejar
+               if c.domain.lstrip('.') == 'youtube.com' or c.domain.endswith('.youtube.com')]
+    valid = {c.name for c in youtube if not c.is_expired(now)}
+    expired = {c.name for c in youtube if c.is_expired(now)} - valid
+    def names(found):
+        return ', '.join(n for n in LOGIN_COOKIES if n in found) or 'none'
+    line = (f'  {len(cookiejar)} cookies read from {browser}, {len(youtube)} for youtube.com; '
+            f'login cookies present: {names(valid)}; expired: {names(expired)}; '
+            f'missing: {names(set(LOGIN_COOKIES) - valid - expired)}')
+    if not len(cookiejar):
+        line += ' (no cookies at all: the keyring or cookie file could not be read?)'
+    return line
 
 
 def is_network_error(err):
@@ -219,6 +242,7 @@ def main():
         return 1
     if not logged_in:
         print(f'Not logged in to YouTube in {browser}, nothing marked.', file=sys.stderr)
+        print(describe_login_cookies(ydl.cookiejar, browser), file=sys.stderr)
         return 1
 
     for i, (video_id, names) in enumerate(videos.items(), 1):
