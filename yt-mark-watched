@@ -38,6 +38,13 @@ import sys
 import time
 import urllib.parse
 
+try:
+    import yt_dlp  # noqa: F401
+except ModuleNotFoundError:
+    # Omarchy packages yt-dlp as a single zipapp with no Python module;
+    # Python can import straight from that file.
+    sys.path.insert(0, '/usr/bin/yt-dlp')
+
 from yt_dlp import YoutubeDL
 from yt_dlp.networking.exceptions import TransportError
 from yt_dlp.utils import DownloadError
